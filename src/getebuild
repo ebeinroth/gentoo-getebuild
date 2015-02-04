@@ -1,0 +1,243 @@
+#!/usr/bin/env python
+
+# Copyright (2008): Emil Beinroth <emilbeinroth@gmx.net>
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+__VERSION__ = "0.1.4"
+
+EBUILD = "/usr/bin/ebuild"
+
+def die(s, c=1):
+   sys.stderr.write("!!! " + s + "\n")
+   sys.exit(c)
+
+def which(filename):
+   if not 'PATH' in os.environ:
+      p = os.defpath
+   else: p = os.environ['PATH']
+   pathlist = p.split (os.pathsep)
+   for xdir in pathlist:
+      path = os.path.join(xdir, filename)
+      if os.access(path, os.X_OK):
+         return path
+   return None
+
+def usage():
+   print("""getebuild [-e|--editor] package-atom [ebuild parameter]
+
+   -e, --editor
+               Open found ebuild with $EDITOR.
+   -c, --changelog
+               Open ChangeLog for package with $PAGER.
+   -i, --ignore-masks
+               Ignore all masking reasons
+   -l, --list
+               Show list of possbile ebuilds.
+   -s, --select
+               Like --list, but let the user choose an ebuild by inputing a
+               number and then continue with the selected ebuild.
+   -h, --help
+               Show this not very informativ text.
+   -V, --version
+               Print version of programm.
+
+  Find ebuild for highest currently stable version of a package or a specific
+  category-package-version atom and
+     - open with editor
+     - or run ebuild(1).
+
+  If the package-atom is a specific version (=app-portage/eix-0.5), the ebuild
+  for that version is selected - regardles of its stability.
+
+This program is covered by the GNU General Public License v2.
+Report bugs to Emil Beinroth <emilbeinroth@gmx.net>.""")
+
+import sys, os, getopt
+
+# Importing portage can take a long time, and it's completely useless if the
+# user just wants to see the help screen or if there is a problem with the
+# command line parsing.
+# -> Parse command line options before importing portage.
+
+LONG_OPTS = [ "changelog", "editor", "list", "select", "ignore-masks", "version", "help" ]
+SHORT_OPTS = "celsiV?h"
+try:
+   opts, args = getopt.gnu_getopt(sys.argv[1:], SHORT_OPTS, LONG_OPTS)
+except getopt.GetoptError:
+   usage()
+   sys.exit(1)
+
+pager = False
+editor = False
+mode = 'best'
+for parameter, argument in opts:
+   if parameter in ("-e", "--editor"):
+      # Check if we have EDITOR in environment, and that it's executable.
+      if not "EDITOR" in os.environ:
+         die("You don't have $EDITOR set in your environment.")
+      editor = os.environ["EDITOR"]
+      if not editor.startswith('/'):
+         editor = which(editor)
+         if not editor:
+            die("%s (your $EDITOR) not found." % os.environ["EDITOR"].__repr__())
+   elif parameter in ("-c", "--changelog"):
+      if not "PAGER" in os.environ:
+         die("You don't have $PAGER set in your environment.")
+      pager = os.environ["PAGER"]
+      if not pager.startswith('/'):
+         pager = which(pager)
+         if not pager:
+            die("%s (your $PAGER) not found." % os.environ["PAGER"].__repr__())
+   elif parameter in ("-l", "--list"):
+      mode = 'list'
+   elif parameter in ("-i", "--ignore-masks"):
+      mode = 'best-any'
+   elif parameter in ("-s", "--select"):
+      mode = 'select'
+   elif parameter in ("-?", "-h", "--help"):
+      usage()
+      exit(0)
+   elif parameter in ["-V", "--version"]:
+      print("getebuild-%s" % (__VERSION__))
+      exit(0)
+
+# There can be one or two arguments.
+# The first one is the package-atom, the second is the optional argument that
+# is passed to ebuild(1).
+if len(args) == 1:
+   package = args[0]
+   ebuild_arg = False
+elif len(args) == 2:
+   # If we are to call ebuild(1), there are no options allowed.
+   if mode == 'list' or editor or pager:
+      die("No options allowed if there is a second argument.");
+   package = args[0]
+   ebuild_arg = args[1]
+else:
+   usage()
+   exit(1)
+
+# We don't want a backtrace if the user hits Control-C, so we add a handler for
+# the SIGINT.
+def sigint(sig, frame):
+   die("Operation aborted by Control-C!", 100 + sig)
+
+import signal
+signal.signal(signal.SIGINT, sigint)
+
+# Everything is ready, import portage (could take some time)
+try: # >= portage-2.2
+   import portage
+   from portage import output
+except: # <=portage-2.1.x
+   try:
+      import portage, output
+      import output
+   except Exception as e:
+      stderr.write('!!! Unable to import portage modules: %s\n' % e)
+      exit(1)
+
+# Unlock so portage can setcpv() (funny stuff)
+portage.settings.unlock()
+
+def ambiguous(e, atom):
+   """Print default message about ambiguous package-specifications."""
+   sys.stderr.write(
+      "!!! The atom %s is ambiguous. Please specify one of the following\n"
+      "!!! fully-qualified names instead:\n\n" % output.green(atom.__repr__()))
+   for i in e[0]:
+      sys.stderr.write("    %s\n" % output.green(i.__repr__()))
+   sys.stderr.write("\n")
+
+def get_ebuild(package, mode="best"):
+   """Get path to best matching ebuild for package-atom.
+
+      mode may be:
+         best-any - ignore all masks
+         best     - just get the best match with masks and stuff
+   """
+   try:
+      cpvs = portage.portdb.xmatch("match-all", package)
+   except ValueError as e:
+      ambiguous(e, package)
+      exit(1)
+   except KeyError as e:
+      try:
+         cpvs = portage.portdb.xmatch("match-all", "="+package)
+         package = "="+package
+      except ValueError as e:
+         ambiguous(e, package)
+         exit(1)
+      except Exception as e:
+         exit(1)
+
+   if not cpvs:
+      die("There are no ebuild to satisfy %s." % output.green(package.__repr__()))
+
+   if package[0] != "=" and mode != "best-any":
+      cpvs = filter(lambda x: len(portage.getmaskingstatus(x)) == 0, cpvs)
+      if not cpvs:
+         die("All ebuilds that satisfy %s are masked." % output.green(package.__repr__()))
+   return portage.best(list(cpvs))
+
+def list_atoms(package, numbers):
+   atoms = dict(enumerate(portage.portdb.xmatch('match-all', package)))
+   for i, cpv in atoms.iteritems():
+      fname = portage.portdb.findname2(cpv)[0]
+      dirname, fname = os.path.dirname(fname), os.path.basename(fname).rsplit('.', 1)[0]
+      if numbers:
+         print("[% 3s] %s.ebuild" % (i, os.path.join(dirname, output.yellow(fname))))
+      else:
+         print("%s.ebuild" % os.path.join(dirname, output.yellow(fname)))
+   return atoms
+
+if mode == 'list':
+   list_atoms(package, numbers=False)
+   exit(0)
+elif mode == 'select':
+   atoms = list_atoms(package, numbers=True)
+   i = None
+   while i not in atoms.keys():
+      try: i = int(raw_input('Number: '))
+      except ValueError:
+         print("Not an integer ..")
+   package = '='+atoms[i]
+
+# Get path to the ebuild
+ebuild = portage.portdb.findname2(get_ebuild(package, mode))[0]
+
+# Open with editor
+if editor:
+   sys.stderr.write(">> %s %s\n" % (editor, ebuild))
+   sys.stderr.flush()
+   os.execve(editor, [editor, ebuild], os.environ)
+
+if pager:
+   changelog = os.path.join(os.path.dirname(ebuild), "ChangeLog")
+   sys.stderr.write(">> %s %s\n" % (pager, changelog))
+   sys.stderr.flush()
+   os.execve(pager, [pager, changelog], os.environ)
+
+# Run ebuild(1)
+if ebuild_arg:
+   sys.stderr.write(">> %s %s %s\n" % ("ebuild", ebuild, ebuild_arg))
+   sys.stderr.flush()
+   os.execve(EBUILD, [EBUILD, ebuild, ebuild_arg], os.environ)
+
+# Or just print the damn thing
+print(ebuild)
+
+# vim:set ft=python et sw=3 ts=3:
